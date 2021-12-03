@@ -1,5 +1,6 @@
 #script config file
 config.py
+config.ini
 update.sh
 rpi-mqtt-monitor.iml
 <
@@ -153,3 +154,5 @@ cython_debug/
 # Local History for Visual Studio Code
 .history/
 
+# Idea
+.idea/
