@@ -4,243 +4,235 @@
 # RUN pip install paho-mqtt
 # RUN sudo apt-get install python-pip
 
-from __future__ import division
-import subprocess
-import time
-import socket
-import paho.mqtt.client as paho
+import configparser
 import json
-import config
-import os
+import logging.handlers
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+import paho.mqtt.client as mqtt
+import psutil
+
+# Only run on Python 3.6 or higher...
+assert sys.version_info >= (3, 6)
+
+# Some globals
+CONFIG_FILE = "config.ini"
+
+# Setup Logging
+
+logger = logging.getLogger("Logger")
+logger.setLevel(logging.DEBUG)
+handler = logging.handlers.SysLogHandler(address='/dev/log')
+formatter = logging.Formatter('%(asctime)s %(message)s')
+handler.setLevel(logging.DEBUG)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 # get device host name - used in mqtt topic
-hostname = socket.gethostname()
+hostname = socket.gethostname().split('.', 1)[0]
 
 
-def check_used_space(path):
-    st = os.statvfs(path)
-    free_space = st.f_bavail * st.f_frsize
-    total_space = st.f_blocks * st.f_frsize
-    used_space = int(100 - ((free_space / total_space) * 100))
-    return used_space
+def get_disk_usage(path):
+    total, used, free = shutil.disk_usage(path)
+    return round(used / total * 100, 2)
 
 
-def check_cpu_load():
-    # bash command to get cpu load from uptime command
-    p = subprocess.Popen("uptime", shell=True, stdout=subprocess.PIPE).communicate()[0]
-    cores = subprocess.Popen("nproc", shell=True, stdout=subprocess.PIPE).communicate()[0]
-    cpu_load = str(p).split("average:")[1].split(", ")[0].replace(' ', '').replace(',', '.')
-    cpu_load = float(cpu_load) / int(cores) * 100
-    cpu_load = round(float(cpu_load), 1)
-    return cpu_load
+def get_cpu_load():
+    load1, load5, load15 = psutil.getloadavg()
+    ncpu = psutil.cpu_count()
+    return round(load1 / ncpu * 100, 2)
 
 
-def check_voltage():
+def get_voltage(block="core"):
+    full_cmd = f"vcgencmd measure_volts {block}| cut -f2 -d= | sed 's/.$//'"
     try:
-        full_cmd = "vcgencmd measure_volts | cut -f2 -d= | sed 's/000//'"
-        voltage = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0]
-        voltage = voltage.strip()[:-1]
-    except Exception:
-        voltage = 0
-    return voltage
+        result = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0]
+    except OSError as e:
+        logger.error(e)
+        result = 0
+    result = result.decode('utf8')[:-1]
+    logger.info(f"CPU {block} voltage: {result}V")
+    return round(float(result), 2)
 
 
-def check_swap():
-    full_cmd = "free -t | awk 'NR == 3 {print $3/$2*100}'"
-    swap = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0]
-    swap = round(float(swap.decode("utf-8").replace(",", ".")), 1)
-    return swap
+def get_swap_usage():
+    result = psutil.swap_memory()
+    return round(result[3], 2)
 
 
-def check_memory():
-    full_cmd = "free -t | awk 'NR == 2 {print $3/$2*100}'"
-    memory = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0]
-    memory = round(float(memory.decode("utf-8").replace(",", ".")))
-    return memory
+def get_memory_usage():
+    result = psutil.virtual_memory()
+    return round(result[2], 2)
 
 
-def check_cpu_temp():
-    full_cmd = "cat /sys/class/thermal/thermal_zone*/temp 2> /dev/null | sed 's/\(.\)..$//' | tail -n 1"
+def get_temperature():
+    full_cmd = "vcgencmd measure_temp | cut -f2 -d= | sed 's/..$//'"
     try:
-        p = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0]
-        cpu_temp = p.decode("utf-8").replace('\n', ' ').replace('\r', '')
-    except Exception:
-        cpu_temp = 0
-    return cpu_temp
+        result = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0]
+    except OSError as e:
+        logger.error(e)
+        result = 0
+    result = result.decode('utf8')[:-1]
+    logger.info(f"CPU Temperature: {result}C")
+    return round(float(result), 2)
 
 
-def check_sys_clock_speed():
-    full_cmd = "awk '{printf (\"%0.0f\",$1/1000); }' </sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
-    return subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0]
+def get_current_clock_speed(clock="arm"):
+    full_cmd = f"vcgencmd measure_clock {clock} | cut  -f2 -d="
+    try:
+        result = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0]
+    except OSError as e:
+        logger.error(e)
+        result = 0
+    result = result.decode('utf8')[:-1]
+    logger.info(f"{clock} clock speed: {result}.")
+    return round(float(result) / 1000 ** 3, 2)
 
 
-def check_uptime():
-    full_cmd = "awk '{print int($1/3600/24)}' /proc/uptime"
-    return int(subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0])
+def get_uptime():
+    uptime = time.time() - psutil.boot_time()
+    return f"{int(uptime // 86400)}:{int((uptime % 86400) // 3600):02d}:{int((uptime % 3600) // 60):02d}." \
+           f"{int(uptime % 60):02d}"
 
 
-def config_json(what_config):
+def generate_config_json(what_config, parsed_config):
     data = {
-        "state_topic": "",
-        "icon": "",
-        "name": "",
-        "unique_id": "",
-        "unit_of_measurement": "",
+        "state_topic": f"{config['broker'].get('mqtt_topic_prefix')}/{hostname}/state",
+        "unique_id": f"{hostname}_{what_config}"
     }
-    data["state_topic"] = config.mqtt_topic_prefix + "/" + hostname + "/" + what_config
-    data["unique_id"] = hostname + "_" + what_config
-    if what_config == "cpuload":
+
+    if what_config == "cpu_load":
         data["icon"] = "mdi:speedometer"
-        data["name"] = hostname + " CPU Usage"
+        data["name"] = f"{hostname} CPU Usage"
         data["unit_of_measurement"] = "%"
-    elif what_config == "cputemp":
+        data["value_template"] = "{{ value_json.cpu_load}}"
+    elif what_config == "cpu_temperature":
         data["icon"] = "hass:thermometer"
-        data["name"] = hostname + " CPU Temperature"
+        data["name"] = f"{hostname} CPU Temperature"
+        data["temperature_unit"] = "C"
         data["unit_of_measurement"] = "°C"
-    elif what_config == "diskusage":
+        data["value_template"] = "{{ value_json.cpu_temp}}"
+    elif what_config == "disk_usage":
         data["icon"] = "mdi:harddisk"
-        data["name"] = hostname + " Disk Usage"
+        data["name"] = f"{hostname} Disk Usage"
         data["unit_of_measurement"] = "%"
-    elif what_config == "voltage":
+        data["value_template"] = "{{ value_json.disk_usage}}"
+    elif what_config == "cpu_voltage":
         data["icon"] = "mdi:speedometer"
-        data["name"] = hostname + " CPU Voltage"
+        data["name"] = f"{hostname} CPU Voltage"
         data["unit_of_measurement"] = "V"
-    elif what_config == "swap":
+        data["value_template"] = "{{ value_json.cpu_voltage}}"
+    elif what_config == "swap_usage":
         data["icon"] = "mdi:harddisk"
-        data["name"] = hostname + " Disk Swap"
+        data["name"] = f"{hostname} Disk Swap"
         data["unit_of_measurement"] = "%"
-    elif what_config == "memory":
+        data["value_template"] = "{{ value_json.swap_utilization}}"
+    elif what_config == "memory_utilization":
         data["icon"] = "mdi:memory"
-        data["name"] = hostname + " Memory Usage"
+        data["name"] = f"{hostname} Memory Usage"
         data["unit_of_measurement"] = "%"
-    elif what_config == "sys_clock_speed":
+        data["value_template"] = "{{ value_json.memory_utilization}}"
+    elif what_config == "clock_speed":
         data["icon"] = "mdi:speedometer"
-        data["name"] = hostname + " CPU Clock Speed"
-        data["unit_of_measurement"] = "MHz"
-    elif what_config == "uptime_days":
+        data["name"] = f"{hostname} CPU Clock Speed"
+        data["unit_of_measurement"] = "GHz"
+        data["value_template"] = "{{ value_json.clock_speed}}"
+    elif what_config == "uptime":
         data["icon"] = "mdi:timer"
-        data["name"] = hostname + " Uptime"
+        data["name"] = f"{hostname} Uptime"
         data["unit_of_measurement"] = "days"
+        data["value_template"] = "{{ value_json.uptime}}"
     else:
-        return ""
-    # Return our built discovery config
+        return False
+    logger.info(json.dumps(data))
     return json.dumps(data)
 
 
-def publish_to_mqtt(cpu_load=0, cpu_temp=0, used_space=0, voltage=0, sys_clock_speed=0, swap=0, memory=0,
-                    uptime_days=0):
-    # connect to mqtt server
-    client = paho.Client()
-    client.username_pw_set(config.mqtt_user, config.mqtt_password)
-    client.connect(config.mqtt_host, int(config.mqtt_port))
-
-    # publish monitored values to MQTT
-    if config.cpu_load:
-        if config.discovery_messages:
-            client.publish("homeassistant/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_cpuload/config",
-                           config_json('cpuload'), qos=0)
-            time.sleep(config.sleep_time)
-        client.publish(config.mqtt_topic_prefix + "/" + hostname + "/cpuload", cpu_load, qos=1)
-        time.sleep(config.sleep_time)
-    if config.cpu_temp:
-        if config.discovery_messages:
-            client.publish("homeassistant/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_cputemp/config",
-                           config_json('cputemp'), qos=0)
-            time.sleep(config.sleep_time)
-        client.publish(config.mqtt_topic_prefix + "/" + hostname + "/cputemp", cpu_temp, qos=1)
-        time.sleep(config.sleep_time)
-    if config.used_space:
-        if config.discovery_messages:
-            client.publish("homeassistant/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_diskusage/config",
-                           config_json('diskusage'), qos=0)
-            time.sleep(config.sleep_time)
-        client.publish(config.mqtt_topic_prefix + "/" + hostname + "/diskusage", used_space, qos=1)
-        time.sleep(config.sleep_time)
-    if config.voltage:
-        if config.discovery_messages:
-            client.publish("homeassistant/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_voltage/config",
-                           config_json('voltage'), qos=0)
-            time.sleep(config.sleep_time)
-        client.publish(config.mqtt_topic_prefix + "/" + hostname + "/voltage", voltage, qos=1)
-        time.sleep(config.sleep_time)
-    if config.swap:
-        if config.discovery_messages:
-            client.publish("homeassistant/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_swap/config",
-                           config_json('swap'), qos=0)
-            time.sleep(config.sleep_time)
-        client.publish(config.mqtt_topic_prefix + "/" + hostname + "/swap", swap, qos=1)
-        time.sleep(config.sleep_time)
-    if config.memory:
-        if config.discovery_messages:
-            client.publish("homeassistant/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_memory/config",
-                           config_json('memory'), qos=0)
-            time.sleep(config.sleep_time)
-        client.publish(config.mqtt_topic_prefix + "/" + hostname + "/memory", memory, qos=1)
-        time.sleep(config.sleep_time)
-    if config.sys_clock_speed:
-        if config.discovery_messages:
-            client.publish(
-                "homeassistant/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_sys_clock_speed/config",
-                config_json('sys_clock_speed'), qos=0)
-            time.sleep(config.sleep_time)
-        client.publish(config.mqtt_topic_prefix + "/" + hostname + "/sys_clock_speed", sys_clock_speed, qos=1)
-        time.sleep(config.sleep_time)
-    if config.uptime:
-        if config.discovery_messages:
-            client.publish("homeassistant/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_uptime_days/config",
-                           config_json('uptime_days'), qos=0)
-            time.sleep(config.sleep_time)
-        client.publish(config.mqtt_topic_prefix + "/" + hostname + "/uptime_days", uptime_days, qos=1)
-        time.sleep(config.sleep_time)
-    # disconnect from mqtt server
-    client.disconnect()
+def generate_update_payload():
+    payload = {
+        "cpu_load": get_cpu_load(),
+        "cpu_temp": get_temperature(),
+        "disk_usage": get_disk_usage("/"),
+        "cpu_voltage": get_voltage("core"),
+        "swap_usage": get_swap_usage(),
+        "memory_utilization": get_memory_usage(),
+        "clock_speed": get_current_clock_speed("arm"),
+        "uptime": get_uptime()
+    }
+    logger.info(json.dumps(payload))
+    return payload
 
 
-def bulk_publish_to_mqtt(cpu_load=0, cpu_temp=0, used_space=0, voltage=0, sys_clock_speed=0, swap=0, memory=0,
-                         uptime_days=0):
-    # compose the CSV message containing the measured values
+def on_publish(client, userdata, result):
+    logger.info("Data published.")
+    pass
 
-    values = cpu_load, float(cpu_temp), used_space, float(voltage), int(sys_clock_speed), swap, memory, uptime_days
-    values = str(values)[1:-1]
 
-    # connect to mqtt server
-    client = paho.Client()
-    client.username_pw_set(config.mqtt_user, config.mqtt_password)
-    client.connect(config.mqtt_host, int(config.mqtt_port))
+def open_mqtt_connection(broker_config):
+    logger.info(
+        f"Connecting to MQTT server at {broker_config['broker'].get('mqtt_broker')}:{int(broker_config['broker'].get('mqtt_port'))}.")
+    client_id = hostname + "-" + uuid.uuid4().hex[16:]
+    client = mqtt.Client(client_id=client_id)
+    client.on_publish = on_publish
+    client.username_pw_set(broker_config['broker'].get('mqtt_user'), broker_config['broker'].get('mqtt_password'))
+    client.connect(broker_config['broker'].get('mqtt_broker'), int(broker_config['broker'].get('mqtt_port')))
+    logger.info("done.")
+    return client
 
-    # publish monitored values to MQTT
-    client.publish(config.mqtt_topic_prefix + "/" + hostname, values, qos=1)
 
-    # disconnect from mqtt server
-    client.disconnect()
+def close_mqtt_connection(client):
+    logger.info("Closing connection to MQTT server.")
+    return client.disconnect()
+
+
+def publish_to_mqtt(topic, payload, qos, mqtt_client):
+    logger.info("Publishing to MQTT Server.")
+    mqtt_client.publish(topic, payload, qos=qos)
+
+    return
+
+
+def read_config(config_file):
+    parsed_config = configparser.ConfigParser()
+    parsed_config.read(filenames=config_file)
+
+    # A valid config file has two compulsory named sections.
+    if not (parsed_config.has_section('broker') and parsed_config.has_section('facets')):
+        raise ValueError(f"Invalid config file: {config_file}.")
+
+    return parsed_config
+
+
+def publish_hass_mqtt_discovery_message(parsed_config):
+    client = open_mqtt_connection(parsed_config)
+    for key in parsed_config['facets']:
+        if not parsed_config.has_section('state') \
+                or not parsed_config.getboolean('state', f'{hostname}_{key}_configured', fallback=False):
+            if parsed_config['facets'].getboolean(key):
+                config_topic = f"homeassistant/sensor/{parsed_config['broker'].get('mqtt_topic_prefix')}/{hostname}_{key}/config"
+                payload = generate_config_json(key, parsed_config)
+                publish_to_mqtt(config_topic, payload, 0, client)
+                if not parsed_config.has_section('state'):
+                    parsed_config.add_section('state')
+                parsed_config.set('state', f"{hostname}_{key}_configured", str(True))
+    # We save the config file, for each active measurement, so we only have to do this once.
+    with open(CONFIG_FILE, 'wt') as configfile:
+        config.write(configfile)
+    return client
 
 
 if __name__ == '__main__':
-    # set all monitored values to False in case they are turned off in the config
-    cpu_load = cpu_temp = used_space = voltage = sys_clock_speed = swap = memory = uptime_days = False
+    logger.info("Starting to get system status")
+    logger.info(f"Reading config file: {CONFIG_FILE}.")
 
-    # delay the execution of the script
-    time.sleep(config.random_delay)
-
-    # collect the monitored values
-    if config.cpu_load:
-        cpu_load = check_cpu_load()
-    if config.cpu_temp:
-        cpu_temp = check_cpu_temp()
-    if config.used_space:
-        used_space = check_used_space('/')
-    if config.voltage:
-        voltage = check_voltage()
-    if config.sys_clock_speed:
-        sys_clock_speed = check_sys_clock_speed()
-    if config.swap:
-        swap = check_swap()
-    if config.memory:
-        memory = check_memory()
-    if config.uptime:
-        uptime_days = check_uptime()
-    # Publish messages to MQTT
-    if config.group_messages:
-        bulk_publish_to_mqtt(cpu_load, cpu_temp, used_space, voltage, sys_clock_speed, swap, memory, uptime_days)
-    else:
-        publish_to_mqtt(cpu_load, cpu_temp, used_space, voltage, sys_clock_speed, swap, memory, uptime_days)
+    config = read_config(CONFIG_FILE)
+    client = publish_hass_mqtt_discovery_message(config)
+    state_topic = f"{config['broker'].get('mqtt_topic_prefix')}/{hostname}/state"
+    payload = generate_update_payload()
+    publish_to_mqtt(state_topic, json.dumps(payload), 0, client)
+    close_mqtt_connection(client)
